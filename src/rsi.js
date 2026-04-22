@@ -28,10 +28,14 @@ const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '300', 
 const VOL_EXIT_CONSECUTIVE = parseInt(process.env.VOL_EXIT_CONSECUTIVE || '2', 10);
 const VOL_EXIT_RATIO      = parseFloat(process.env.VOL_EXIT_RATIO     || '1.0');
 const VOL_EXIT_LOOKBACK   = parseInt(process.env.VOL_EXIT_LOOKBACK    || '4', 10);
+// ★ 量能萎缩出场总开关（默认 false，彻底关闭此出场逻辑）
+const VOL_DECAY_EXIT_ENABLED = (process.env.VOL_DECAY_EXIT_ENABLED || 'false') === 'true';
 const SKIP_FIRST_CANDLES  = parseInt(process.env.SKIP_FIRST_CANDLES   || '8', 10);
 
 // 止盈止损
 const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || '50');
+// ★ 固定止盈总开关（默认 false，彻底关闭固定止盈，只靠移动止损/止损/RSI 出场）
+const TAKE_PROFIT_ENABLED = (process.env.TAKE_PROFIT_ENABLED || 'false') === 'true';
 const STOP_LOSS_PCT   = parseFloat(process.env.STOP_LOSS_PCT   || '-20');
 
 // 移动止损（Trailing Stop）
@@ -150,6 +154,8 @@ function checkBuyVolume(closedCandles, currentCandle) {
 }
 
 function checkVolumeDecay(closedCandles, tokenState) {
+  // ★ 总开关：VOL_DECAY_EXIT_ENABLED=false 时彻底禁用量能萎缩出场
+  if (!VOL_DECAY_EXIT_ENABLED) return { shouldExit: false, reason: 'VOL_DECAY_EXIT_DISABLED' };
   if (!VOL_ENABLED) return { shouldExit: false, reason: '' };
   if (closedCandles.length < VOL_EXIT_LOOKBACK + VOL_EXIT_CONSECUTIVE) {
     return { shouldExit: false, reason: 'INSUFFICIENT_DATA' };
@@ -212,7 +218,8 @@ function checkStopLoss(currentPrice, tokenState) {
   }
 
   // ── 固定止盈 / 固定止损 ───────────────────────────────────────
-  if (pnl >= TAKE_PROFIT_PCT) {
+  // ★ 固定止盈已默认禁用（TAKE_PROFIT_ENABLED=false），只走移动止损/RSI 出场
+  if (TAKE_PROFIT_ENABLED && pnl >= TAKE_PROFIT_PCT) {
     return { shouldExit: true, reason: `TAKE_PROFIT(+${pnl.toFixed(1)}%≥${TAKE_PROFIT_PCT}%)` };
   }
   if (pnl <= STOP_LOSS_PCT) {
@@ -326,7 +333,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     // 4. 卖压卖出 — 已彻底禁用
     // if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT ...) { ... }
 
-    // 5. 量能萎缩出场
+    // 5. 量能萎缩出场（★ 默认已禁用，由 VOL_DECAY_EXIT_ENABLED 控制，函数内部短路返回）
     const volDecay = checkVolumeDecay(closedCandles, tokenState);
     if (volDecay.shouldExit) {
       updateState();
