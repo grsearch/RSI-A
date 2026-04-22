@@ -29,15 +29,19 @@ const HELIUS_GATEKEEPER_URL  = process.env.HELIUS_GATEKEEPER_URL || '';
 const HELIUS_API_KEY         = process.env.HELIUS_API_KEY || '';
 const HELIUS_RPC_URL         = process.env.HELIUS_RPC_URL || '';
 
-// "auto" | "token" | "pump"
-// token = 按 mint 精准订阅，不管代币在哪个 AMM 上交易都能收到（适合混合AMM，但对 Pump 代币可能漏单）
-// auto  = 代币数 ≤ HELIUS_TOKEN_LIMIT 用 token，超过自动切 pump（推荐默认）
-// pump  = 强制 Pump AMM 单订阅（只适合全部代币都在 pumpAMM 上交易的场景）
-// ★ 默认改为 auto：Pump 代币在 token 模式下 accountInclude:[mint] 经常匹配不到
-//   （mint 不一定作为 top-level accountKey 出现），pump 模式全量订阅更稳
-const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'auto').toLowerCase();
+// "multi" | "token" | "pump" | "auto"
+// ★ multi = 所有 mint 合并成一个 transactionSubscribe(accountInclude: [mint1, mint2, ...])
+//           每次加/删 token 时重订阅。只占 1 个 subscription slot，彻底规避多订阅丢单问题。
+//           适合所有场景（Pump / Raydium / 其他 DEX 混合），推荐默认。
+// token = 每个 mint 一个独立 transactionSubscribe。credits 最省但容易丢单，不推荐。
+// pump  = 一个 transactionSubscribe(accountInclude: [PumpAMM])，全量订阅后过滤。
+//         只适合全部代币都在 pumpAMM 上交易的场景。
+// auto  = 代币数 ≤ HELIUS_TOKEN_LIMIT 用 token，超过自动切 pump（不推荐，会漏非 Pump 代币）
+const CFG_SUB_MODE    = (process.env.HELIUS_SUB_MODE || 'multi').toLowerCase();
 // auto 模式下，超过此数量自动切换到 pump 单订阅
 const TOKEN_LIMIT     = parseInt(process.env.HELIUS_TOKEN_LIMIT || '50', 10);
+// multi 模式：token 增删后延迟多久重订阅（防抖，避免批量添加时频繁重订）
+const MULTI_RESUB_DEBOUNCE_MS = parseInt(process.env.HELIUS_MULTI_DEBOUNCE_MS || '500', 10);
 
 function getWsUrl() {
   if (HELIUS_GATEKEEPER_URL) {
@@ -86,15 +90,23 @@ class HeliusTradeStream {
     // pump 模式的 subId
     this._pumpSubId = null;
 
+    // ★ multi 模式的 subId 和重订阅防抖定时器
+    this._multiSubId = null;
+    this._multiResubTimer = null;
+
     // ★ 实际激活的模式（auto模式下动态变化）
-    // 初始值根据配置决定：手动指定 pump/token 则固定，auto 则从 token 开始
-    this._activeMode = CFG_SUB_MODE === 'pump' ? 'pump' : 'token';
+    // 初始值根据配置决定
+    if (CFG_SUB_MODE === 'pump')       this._activeMode = 'pump';
+    else if (CFG_SUB_MODE === 'multi') this._activeMode = 'multi';
+    else if (CFG_SUB_MODE === 'auto')  this._activeMode = 'token';  // auto 从 token 起步
+    else                               this._activeMode = 'token';
 
     this._stats = { txReceived: 0, txMatched: 0, txParsed: 0, txSkipped: 0, connType: 'none', subMode: this._activeMode };
   }
 
   // ── 当前是否使用 pump 模式 ──────────────────────────────────
-  _isPumpMode() { return this._activeMode === 'pump'; }
+  _isPumpMode()  { return this._activeMode === 'pump'; }
+  _isMultiMode() { return this._activeMode === 'multi'; }
 
   // ── 生命周期 ────────────────────────────────────────────────
 
@@ -141,6 +153,9 @@ class HeliusTradeStream {
       // 重连后恢复订阅（用当前激活的模式）
       if (this._isPumpMode()) {
         this._subscribePumpAmm();
+      } else if (this._isMultiMode()) {
+        // ★ multi 模式：直接发一个包含所有 mint 的订阅
+        this._subscribeMulti();
       } else {
         // ★ 按顺序延迟恢复订阅，每个间隔150ms，避免瞬间大量请求压垮连接
         let i = 0;
@@ -148,7 +163,7 @@ class HeliusTradeStream {
           info.subId = null;
           const delay = i * 150;
           setTimeout(() => {
-            if (this._tokens.has(address) && this._connected && !this._isPumpMode()) {
+            if (this._tokens.has(address) && this._connected && !this._isPumpMode() && !this._isMultiMode()) {
               this._subscribeToken(address);
             }
           }, delay);
@@ -166,6 +181,7 @@ class HeliusTradeStream {
       this._connected = false;
       this._pendingSubs.clear();
       this._pumpSubId = null;
+      this._multiSubId = null;
       if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
 
       if (this._retryCount < MAX_RETRIES) {
@@ -203,6 +219,61 @@ class HeliusTradeStream {
       ],
     }));
     logger.info('[HeliusWS] 📡 订阅 Pump AMM program (单订阅模式)');
+  }
+
+  // ── 订阅：Multi 模式（所有 mint 合并成一个订阅）─────────────
+  // 核心优势：无论多少个 token，只占 1 个 subscription slot，彻底规避多订阅丢单。
+  // 加/删 token 时：取消旧订阅 → 发新订阅（带新 mint 列表）。
+  _subscribeMulti() {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+
+    const mints = Array.from(this._tokens.keys());
+    if (mints.length === 0) {
+      logger.info('[HeliusWS] multi 模式：无 token，暂不订阅');
+      return;
+    }
+
+    // 先取消旧订阅（如果有）
+    if (this._multiSubId) {
+      const oldSubId = this._multiSubId;
+      this._multiSubId = null;
+      try {
+        this._ws.send(JSON.stringify({
+          jsonrpc: '2.0', id: this._nextRpcId++,
+          method: 'transactionUnsubscribe',
+          params: [oldSubId],
+        }));
+        logger.info('[HeliusWS] 🔕 取消旧 multi 订阅 subId=%s', oldSubId);
+      } catch (_) {}
+    }
+
+    const rpcId = this._nextRpcId++;
+    this._pendingSubs.set(rpcId, '__multi__');
+
+    this._ws.send(JSON.stringify({
+      jsonrpc: '2.0',
+      id: rpcId,
+      method: 'transactionSubscribe',
+      params: [
+        { accountInclude: mints, failed: false },
+        {
+          commitment: 'confirmed',
+          encoding: 'jsonParsed',
+          transactionDetails: 'full',
+          maxSupportedTransactionVersion: 0,
+        },
+      ],
+    }));
+    logger.info('[HeliusWS] 📡 订阅 multi 模式，%d 个 mint (rpcId=%d)', mints.length, rpcId);
+  }
+
+  // ★ 防抖触发重订阅：批量 add/remove 时只重订一次
+  _scheduleMultiResub() {
+    if (this._multiResubTimer) clearTimeout(this._multiResubTimer);
+    this._multiResubTimer = setTimeout(() => {
+      this._multiResubTimer = null;
+      if (this._connected && this._isMultiMode()) this._subscribeMulti();
+    }, MULTI_RESUB_DEBOUNCE_MS);
   }
 
   // ── 订阅：按 Token 精准模式 ───────────────────────────────
@@ -267,16 +338,18 @@ class HeliusTradeStream {
     if (CFG_SUB_MODE === 'auto' && this._activeMode === 'token' && count > TOKEN_LIMIT) {
       logger.info('[HeliusWS] 🔄 代币数 %d > 上限 %d，自动切换到 pump 单订阅模式', count, TOKEN_LIMIT);
       this._upgradeToPump();
-      // 升级后 pump 模式已覆盖所有代币，直接返回
       logger.info('[HeliusWS] 📌 注册 token %s (%s)，当前监控 %d 个 (模式=pump[auto升级])',
         symbol, tokenAddress.slice(0, 8) + '...', count);
       return;
     }
 
-    if (!this._isPumpMode() && this._connected) {
+    if (this._isMultiMode()) {
+      // ★ multi 模式：防抖重订阅（批量 add 时只重订一次）
+      if (this._connected) this._scheduleMultiResub();
+    } else if (!this._isPumpMode() && this._connected) {
       // token 模式：发送独立订阅（稍微延迟，避免连发）
       setTimeout(() => {
-        if (this._tokens.has(tokenAddress) && this._connected && !this._isPumpMode()) {
+        if (this._tokens.has(tokenAddress) && this._connected && !this._isPumpMode() && !this._isMultiMode()) {
           this._subscribeToken(tokenAddress);
         }
       }, 50);
@@ -288,11 +361,15 @@ class HeliusTradeStream {
   }
 
   unsubscribe(tokenAddress) {
-    // token 模式：取消独立订阅（pump模式不需要，全局订阅覆盖）
-    if (!this._isPumpMode()) {
+    // token 模式：取消独立订阅（pump/multi 模式不需要）
+    if (!this._isPumpMode() && !this._isMultiMode()) {
       this._unsubscribeToken(tokenAddress);
     }
     this._tokens.delete(tokenAddress);
+
+    // multi 模式：删完触发重订阅（防抖）
+    if (this._isMultiMode() && this._connected) this._scheduleMultiResub();
+
     logger.info('[HeliusWS] 🔕 移除 token %s，剩余 %d 个 (模式=%s)',
       tokenAddress.slice(0, 8) + '...', this._tokens.size, this._activeMode);
   }
@@ -329,15 +406,26 @@ class HeliusTradeStream {
     let msg;
     try { msg = JSON.parse(rawData.toString('utf8')); } catch (_) { return; }
 
-    // 订阅确认
-    if (msg.id && msg.result !== undefined) {
+    // 订阅确认 / 订阅错误
+    if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
       const key = this._pendingSubs.get(msg.id);
+      this._pendingSubs.delete(msg.id);
+
+      // ★ 订阅错误：打日志并清理状态（multi 模式下会被后续 _scheduleMultiResub 重试）
+      if (msg.error) {
+        logger.error('[HeliusWS] ❌ 订阅失败 key=%s error=%s',
+          key, JSON.stringify(msg.error));
+        return;
+      }
+
       if (key === '__pump__') {
         this._pumpSubId = msg.result;
-        this._pendingSubs.delete(msg.id);
         logger.info('[HeliusWS] ✅ Pump AMM 订阅确认 subId=%s', msg.result);
+      } else if (key === '__multi__') {
+        this._multiSubId = msg.result;
+        logger.info('[HeliusWS] ✅ Multi 订阅确认 subId=%s (%d 个 mint)',
+          msg.result, this._tokens.size);
       } else if (key) {
-        this._pendingSubs.delete(msg.id);
         const info = this._tokens.get(key);
         if (info) {
           info.subId = msg.result;
@@ -369,8 +457,8 @@ class HeliusTradeStream {
       const postTokenBals = meta.postTokenBalances || [];
       if (postTokenBals.length === 0) return;
 
-      if (this._isPumpMode()) {
-        // ── pump 模式：从交易中提取 mint，匹配监控列表 ──
+      if (this._isPumpMode() || this._isMultiMode()) {
+        // ── pump / multi 模式：从交易中提取 mint，匹配监控列表 ──
         const involvedMints = new Set(postTokenBals.map(b => b.mint).filter(Boolean));
         let matched = false;
 
@@ -498,12 +586,16 @@ class HeliusTradeStream {
     for (const info of this._tokens.values()) {
       if (info.subId) confirmedSubs++;
     }
+    let reportedSubs;
+    if (this._isPumpMode())      reportedSubs = this._pumpSubId  ? 1 : 0;
+    else if (this._isMultiMode()) reportedSubs = this._multiSubId ? 1 : 0;
+    else                          reportedSubs = confirmedSubs;
     return {
       connected:     this._connected,
       connType:      this._connType,
       subMode:       this._activeMode,
       tokens:        this._tokens.size,
-      confirmedSubs: this._isPumpMode() ? (this._pumpSubId ? 1 : 0) : confirmedSubs,
+      confirmedSubs: reportedSubs,
       retryCount:    this._retryCount,
       ...this._stats,
     };
@@ -513,8 +605,12 @@ class HeliusTradeStream {
   getTokenStats(tokenAddress) {
     const info = this._tokens.get(tokenAddress);
     if (!info) return null;
+    let subIdShown;
+    if (this._isMultiMode())     subIdShown = this._multiSubId ? `multi:${this._multiSubId}` : 'multi:pending';
+    else if (this._isPumpMode()) subIdShown = this._pumpSubId  ? `pump:${this._pumpSubId}`   : 'pump:pending';
+    else                         subIdShown = info.subId;
     return {
-      subId:       info.subId,         // token 模式下为订阅 id，pump 模式为 null（走全局订阅）
+      subId:       subIdShown,
       chainRx:     info.chainRx || 0,
       chainParsed: info.chainParsed || 0,
       lastRxTs:    info.lastRxTs || 0,
