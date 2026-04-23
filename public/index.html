@@ -418,6 +418,7 @@ function _updateTickCells(tr, d) {
   if (cst) {
     const hm = cst.histMeta || {};
     const ago = hm.fetchedAt ? Math.floor((Date.now() - hm.fetchedAt) / 1000) + 's前' : '未拉取';
+    const needRefetch = cst.histCount === 0 && hm.error && hm.error !== 'NO_DATA';
     cells[11].title =
       `K线数量构成:\n` +
       `- 历史(Birdeye): ${cst.histCount}\n` +
@@ -429,7 +430,30 @@ function _updateTickCells(tr, d) {
       `- 去最后一根后: ${hm.closedBars ?? '?'} 根\n` +
       `- HTTP 状态: ${hm.httpStatus ?? '?'}\n` +
       `- 错误: ${hm.error ?? '无'}\n` +
-      `- 拉取时间: ${ago}`;
+      `- 拉取时间: ${ago}` +
+      (needRefetch ? '\n\n★ 双击此格子可手动重拉历史K线' : '');
+    if (needRefetch) {
+      cells[11].style.cssText = 'cursor:pointer;color:#f0883e;font-weight:bold';
+      cells[11].ondblclick = async () => {
+        cells[11].textContent = '...';
+        try {
+          const r = await fetch(`/api/tokens/${d.address}/refetch-history`, { method: 'POST' });
+          const j = await r.json();
+          if (j.ok) {
+            cells[11].textContent = '已入队';
+            cells[11].title = `已加入重拉队列 (队列长度: ${j.queueSize})，等待数据返回...`;
+          } else {
+            cells[11].textContent = d.closedCount ?? '-';
+          }
+        } catch (err) {
+          cells[11].textContent = d.closedCount ?? '-';
+          alert('重拉失败: ' + err.message);
+        }
+      };
+    } else {
+      cells[11].style.cssText = '';
+      cells[11].ondblclick = null;
+    }
   } else {
     cells[11].title = '';
   }

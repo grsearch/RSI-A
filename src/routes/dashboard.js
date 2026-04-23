@@ -37,6 +37,13 @@ router.delete('/tokens/:address', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ★ 手动重拉历史K线（Birdeye 429 导致某些币历史K线为空时使用）
+router.post('/tokens/:address/refetch-history', (req, res) => {
+  const result = monitor.refetchHistory(req.params.address);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
 router.get('/trades', (_req, res) => {
   const logs = monitor.getTokens().flatMap(t => t.tradeLogs || []);
   logs.sort((a, b) => b.ts - a.ts);

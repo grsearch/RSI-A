@@ -38,6 +38,74 @@ const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10
 const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);  // ★ V5: 最大监控数
 const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 10); // ★ V5: FDV/LP巡检间隔(秒)
 
+// ★ 历史K线拉取队列：串行执行 + 退避，避免 Birdeye 429
+//   - HIST_FETCH_GAP_MS: 每个请求间隔
+//   - HIST_RETRY_MAX:    429/错误时最大重试次数
+//   - HIST_RETRY_BASE:   退避基准（指数退避：base × 2^n）
+const HIST_FETCH_GAP_MS = parseInt(process.env.HIST_FETCH_GAP_MS || '1200', 10);
+const HIST_RETRY_MAX    = parseInt(process.env.HIST_RETRY_MAX    || '5',   10);
+const HIST_RETRY_BASE_MS = parseInt(process.env.HIST_RETRY_BASE_MS || '5000', 10);
+
+class HistFetchQueue {
+  constructor() {
+    this._queue = [];     // [{ address, symbol, attempt, resolve }]
+    this._running = false;
+    this._seen = new Set(); // 去重，同一个 address 已在队列中则跳过
+  }
+  // 返回 Promise：resolve(candles 或 []) —— 外部拿不到也没关系，结果已经 set 到 state
+  enqueue(address, symbol, onDone, attempt = 1) {
+    if (this._seen.has(address) && attempt === 1) {
+      logger.debug('[HistQueue] %s 已在队列，跳过重复入队', symbol);
+      return;
+    }
+    this._seen.add(address);
+    this._queue.push({ address, symbol, attempt, onDone });
+    logger.debug('[HistQueue] 入队 %s (attempt=%d, 队列长=%d)', symbol, attempt, this._queue.length);
+    this._drain();
+  }
+  async _drain() {
+    if (this._running) return;
+    this._running = true;
+    while (this._queue.length > 0) {
+      const job = this._queue.shift();
+      try {
+        const candles = await birdeye.getOHLCV(job.address, KLINE_SEC, HIST_BARS);
+        const meta = candles?._meta || {};
+        const needRetry =
+          candles.length === 0 &&
+          (meta.error === 'HTTP_429' || meta.error === 'TIMEOUT' || /^HTTP_5\d\d$/.test(meta.error || ''));
+
+        if (needRetry && job.attempt < HIST_RETRY_MAX) {
+          const backoff = HIST_RETRY_BASE_MS * Math.pow(2, job.attempt - 1);
+          logger.warn('[HistQueue] %s 拉取失败(%s) 第%d次，%ds 后重试',
+            job.symbol, meta.error, job.attempt, Math.round(backoff / 1000));
+          setTimeout(() => {
+            this._seen.delete(job.address);  // 允许重新入队
+            this.enqueue(job.address, job.symbol, job.onDone, job.attempt + 1);
+          }, backoff);
+        } else {
+          this._seen.delete(job.address);
+          if (job.onDone) job.onDone(candles);
+          if (needRetry) {
+            logger.error('[HistQueue] %s 重试 %d 次仍失败(%s)，放弃',
+              job.symbol, HIST_RETRY_MAX, meta.error);
+          }
+        }
+      } catch (err) {
+        logger.warn('[HistQueue] %s 异常: %s', job.symbol, err.message);
+        this._seen.delete(job.address);
+        if (job.onDone) job.onDone([]);
+      }
+      // 每次请求间隔
+      if (this._queue.length > 0) await new Promise(r => setTimeout(r, HIST_FETCH_GAP_MS));
+    }
+    this._running = false;
+  }
+  queueSize() { return this._queue.length; }
+}
+
+const histFetchQueue = new HistFetchQueue();
+
 // 全局交易记录
 const _allTradeRecords = [];
 
@@ -151,15 +219,15 @@ class TokenMonitor extends EventEmitter {
             }
           } catch (_) {}
 
-          // ★ 重启后重新拉取历史K线（historicalCandles 不持久化，重启必须重拉）
-          birdeye.getOHLCV(t.address, KLINE_SEC, HIST_BARS).then(histCandles => {
+          // ★ 重启后重新拉取历史K线（走队列，串行+退避重试，避免 Birdeye 429）
+          histFetchQueue.enqueue(t.address, t.symbol, (histCandles) => {
             const s = this._tokens.get(t.address);
             if (!s) return;
             s._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'EMPTY' };
             if (!histCandles || histCandles.length === 0) return;
             s.historicalCandles = histCandles;
             logger.info('[Monitor] ♻️ %s 历史K线重载: %d 根', t.symbol, histCandles.length);
-          }).catch(() => {});
+          });
         }
       }
     } catch (err) {
@@ -281,17 +349,19 @@ class TokenMonitor extends EventEmitter {
         }
       } catch (_) {}
 
-      // 2. 拉取历史K线（用于 EMA99/RSI 预热，无需等待K线自然积累）
-      try {
-        const histCandles = await birdeye.getOHLCV(address, KLINE_SEC, HIST_BARS);
+      // 2. 拉取历史K线（走队列，串行 + 429重试，避免 Birdeye 限流）
+      histFetchQueue.enqueue(address, symbol, (histCandles) => {
+        const s2 = this._tokens.get(address);
+        if (!s2) return;
+        s2._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'UNKNOWN' };
         if (histCandles && histCandles.length > 0) {
-          s.historicalCandles = histCandles;
+          s2.historicalCandles = histCandles;
           logger.info('[Monitor] %s 历史K线预热: %d 根 (EMA99/RSI立即可用)',
             symbol, histCandles.length);
+        } else {
+          logger.warn('[Monitor] %s 历史K线预热失败: %s', symbol, s2._histMeta.error);
         }
-        // ★ 诊断：记录历史K线拉取情况（不管成功失败都记）
-        s._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'UNKNOWN' };
-      } catch (_) {}
+      });
     })();
 
     logger.info("[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s",
@@ -332,6 +402,22 @@ class TokenMonitor extends EventEmitter {
   getToken(address) {
     const s = this._tokens.get(address);
     return s ? this._stateSnapshot(s) : null;
+  }
+
+  // ★ 手动重拉某个代币的历史K线（前端"K线数量过少"时用）
+  refetchHistory(address) {
+    const state = this._tokens.get(address);
+    if (!state) return { ok: false, error: 'token_not_found' };
+    histFetchQueue.enqueue(address, state.symbol, (histCandles) => {
+      const s = this._tokens.get(address);
+      if (!s) return;
+      s._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'EMPTY' };
+      if (histCandles && histCandles.length > 0) {
+        s.historicalCandles = histCandles;
+        logger.info('[Monitor] 🔄 %s 手动重拉历史K线: %d 根', state.symbol, histCandles.length);
+      }
+    });
+    return { ok: true, queueSize: histFetchQueue.queueSize() };
   }
 
   // ── Birdeye WS 实时价格回调（<150ms 延迟） ─────────────────────
