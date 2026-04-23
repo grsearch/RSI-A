@@ -467,6 +467,14 @@ class TokenMonitor extends EventEmitter {
     const lastClose = state._rsiLastClose;
     if (!Number.isFinite(avgGain) || !Number.isFinite(avgLoss) || !Number.isFinite(lastClose)) return;
 
+    // ★ V5-9: K线数不足时 RSI 不收敛，实时 stepRSI 会乱跳（虚假下穿）
+    //         已收盘K线数 = 历史 + 实时，两者都算进来
+    const histLen = (state.historicalCandles && state.historicalCandles.length) || 0;
+    const liveLen = state._rsiClosedCount || 0;
+    const totalClosed = histLen + liveLen;
+    const MIN_CANDLES_FOR_SIGNAL = RSI_CONFIG.MIN_CANDLES_FOR_SIGNAL;
+    if (totalClosed < MIN_CANDLES_FOR_SIGNAL) return;
+
     // 用当前实时价格计算实时 RSI
     const rsiNow = stepRSI(avgGain, avgLoss, lastClose, price);
     if (!Number.isFinite(rsiNow)) return;
@@ -632,6 +640,13 @@ class TokenMonitor extends EventEmitter {
               state._rsiAvgLoss     = avgLoss;
               state._rsiLastClose   = closes[len - 1];
               state._rsiLastCandleTs = lastCandleTsPoll;
+            }
+            // ★ V5-9: 保存当前 closedCandles 数量，供 _checkRealtimeRsiSell 判断是否已收敛
+            state._rsiClosedCount = len;
+
+            // ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时 RSI 未收敛，跳过所有 RSI 卖出逻辑
+            if (len < RSI_CONFIG.MIN_CANDLES_FOR_SIGNAL) {
+              continue; // 进入下一轮轮询
             }
 
             // ★ 用 stepRSI 计算实时 RSI（基于当前价格，而非等K线收盘）

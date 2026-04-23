@@ -33,10 +33,12 @@ const VOL_DECAY_EXIT_ENABLED = (process.env.VOL_DECAY_EXIT_ENABLED || 'false') =
 const SKIP_FIRST_CANDLES  = parseInt(process.env.SKIP_FIRST_CANDLES   || '8', 10);
 
 // 止盈止损
-const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || '50');
-// ★ 固定止盈总开关（默认 false，彻底关闭固定止盈，只靠移动止损/止损/RSI 出场）
-const TAKE_PROFIT_ENABLED = (process.env.TAKE_PROFIT_ENABLED || 'false') === 'true';
+const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || '100');
+// ★ 固定止盈总开关（默认 true，+100% 时止盈卖出）
+const TAKE_PROFIT_ENABLED = (process.env.TAKE_PROFIT_ENABLED || 'true') === 'true';
 const STOP_LOSS_PCT   = parseFloat(process.env.STOP_LOSS_PCT   || '-20');
+// ★ 固定止损总开关（默认 false，只靠移动止损/RSI 出场；注意这会使最大回撤不可控）
+const STOP_LOSS_ENABLED = (process.env.STOP_LOSS_ENABLED || 'false') === 'true';
 
 // 移动止损（Trailing Stop）
 const TRAILING_STOP_ENABLED  = (process.env.TRAILING_STOP_ENABLED  || 'true') === 'true';
@@ -45,6 +47,15 @@ const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || 
 
 // EMA99 买入过滤：价格必须在 EMA99 下方才允许买入
 const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
+// ★ EMA99 不足时的行为：strict=拒绝买入(推荐), lenient=跳过该过滤(旧行为,有漏洞)
+const EMA_INSUFFICIENT_MODE = (process.env.EMA_INSUFFICIENT_MODE || 'strict').toLowerCase();
+// ★ 产生买卖信号所需的最小已收盘K线数（低于此数量完全不产生信号，避免 RSI 不收敛误判）
+//   默认 max(SKIP_FIRST_CANDLES, RSI_PERIOD × 3) ≈ 21，这是 Wilder RSI 收敛所需
+const MIN_CANDLES_FOR_SIGNAL = parseInt(
+  process.env.MIN_CANDLES_FOR_SIGNAL ||
+  String(Math.max(parseInt(process.env.SKIP_FIRST_CANDLES || '8', 10), RSI_PERIOD * 3)),
+  10
+);
 
 function calcEMA(closes, period) {
   if (closes.length < period) return NaN;
@@ -222,7 +233,8 @@ function checkStopLoss(currentPrice, tokenState) {
   if (TAKE_PROFIT_ENABLED && pnl >= TAKE_PROFIT_PCT) {
     return { shouldExit: true, reason: `TAKE_PROFIT(+${pnl.toFixed(1)}%≥${TAKE_PROFIT_PCT}%)` };
   }
-  if (pnl <= STOP_LOSS_PCT) {
+  // ★ 固定止损已默认禁用（STOP_LOSS_ENABLED=false）
+  if (STOP_LOSS_ENABLED && pnl <= STOP_LOSS_PCT) {
     return { shouldExit: true, reason: `STOP_LOSS(${pnl.toFixed(1)}%≤${STOP_LOSS_PCT}%)` };
   }
 
@@ -240,6 +252,10 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   if (closedCandles.length < SKIP_FIRST_CANDLES) {
     return { rsi: NaN, prevRsi: NaN, signal: null, reason: `skip_first(${closedCandles.length}/${SKIP_FIRST_CANDLES})`, volume: {} };
   }
+
+  // ★ RSI 收敛门槛：低于 MIN_CANDLES_FOR_SIGNAL 时不产生买卖信号
+  //   但依然返回 rsi 供前端展示（只是不用这个 rsi 做交易决策）
+  const belowConvergence = closedCandles.length < MIN_CANDLES_FOR_SIGNAL;
 
   const closes = closedCandles.map(c => c.close);
   const len    = closes.length;
@@ -304,7 +320,8 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     //    ★ V5: 只信任已收盘K线RSI（lastClosedRsi），不用 stepRSI 实时估算
     //    stepRSI 在K线内波动剧烈时容易算出虚假高值（如95.7），
     //    导致在RSI实际只有40-60的时候误触恐慌卖出
-    if (lastClosedRsi > RSI_PANIC) {
+    //    ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时不触发 RSI 卖出（RSI 未收敛会乱跳）
+    if (!belowConvergence && lastClosedRsi > RSI_PANIC) {
       const lastPanicTs = tokenState._lastPanicSellTs ?? 0;
       if (nowMs - lastPanicTs >= 2000) {
         tokenState._lastPanicSellTs = nowMs;
@@ -315,7 +332,8 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
     }
 
     // 2. RSI 下穿 70
-    if (prevRsi >= RSI_SELL && rsiRealtime < RSI_SELL && lastCandleTs !== lastSellCandle) {
+    //    ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时不触发（RSI 未收敛容易虚假下穿）
+    if (!belowConvergence && prevRsi >= RSI_SELL && rsiRealtime < RSI_SELL && lastCandleTs !== lastSellCandle) {
       tokenState._lastSellCandle = lastCandleTs;
       updateState();
       return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
@@ -345,10 +363,25 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   // ── BUY ────────────────────────────────────────────────────────
   // ★ RSI < 30（超卖区）+ buyVol >= 1.2 × sellVol
   if (!tokenState.inPosition) {
+    // ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时不买入（RSI/EMA 都未收敛）
+    if (belowConvergence) {
+      updateState();
+      return { rsi: rsiRealtime, prevRsi, signal: null,
+               reason: `INSUFFICIENT_CANDLES(${closedCandles.length}/${MIN_CANDLES_FOR_SIGNAL})`, volume: volumeInfo };
+    }
     if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
       // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
       const ema99 = calcEMA(closes, EMA_PERIOD);
-      if (Number.isFinite(ema99) && realtimePrice >= ema99) {
+      if (!Number.isFinite(ema99)) {
+        // K线不足 99 根，无法计算 EMA99
+        if (EMA_INSUFFICIENT_MODE === 'strict') {
+          // ★ 严格模式：直接拒绝买入，避免新币/数据不足时误买
+          updateState();
+          return { rsi: rsiRealtime, prevRsi, signal: null,
+                   reason: `EMA99_INSUFFICIENT_DATA(${closes.length}/${EMA_PERIOD})`, volume: volumeInfo };
+        }
+        // lenient 模式：跳过 EMA99 过滤（旧行为，不推荐）
+      } else if (realtimePrice >= ema99) {
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: null,
                  reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
@@ -497,6 +530,6 @@ module.exports = {
     SKIP_FIRST_CANDLES,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, KLINE_SEC,
     TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
-    EMA_PERIOD,
+    EMA_PERIOD, MIN_CANDLES_FOR_SIGNAL,
   },
 };
