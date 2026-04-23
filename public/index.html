@@ -390,6 +390,15 @@ function _updateTickCells(tr, d) {
     cells[1].innerHTML = `<a href="${gmgnUrl(d.address)}" target="_blank" class="gmgn" title="${d.address}">${addrShort(d.address)}</a>`;
   }
   cells[2].textContent = fmt(d.price, 8);
+  // ★ V5-13: Birdeye 价格拉取失败时橙色高亮 + tooltip
+  if (d.priceFail) {
+    const remaining = Math.round(d.priceFail.remainingMs / 1000);
+    cells[2].style.cssText = 'color:#f0883e;font-weight:bold;cursor:help';
+    cells[2].title = `Birdeye 价格拉取失败\n状态: HTTP ${d.priceFail.status}\n累计: ${d.priceFail.count} 次\n静默中，${remaining}s 后重试\n\n可能原因: Birdeye 无此代币数据，建议手动移除`;
+  } else {
+    cells[2].style.cssText = '';
+    cells[2].title = '';
+  }
   cells[3].textContent = fmtFdv(d.fdv); cells[3].className = 'fdv-val';
   cells[4].textContent = fmtFdv(d.lp);  cells[4].className = 'lp-val';
   cells[5].textContent = fmtAge(d.createdAt); cells[5].style.cssText = 'color:#8b949e;font-size:11px';

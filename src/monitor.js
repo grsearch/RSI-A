@@ -746,15 +746,13 @@ class TokenMonitor extends EventEmitter {
       price = state._lastPriceUsd;
     } else {
       // WS 价格过期或没有，发 HTTP 兜底
-      try {
-        price = await birdeye.getPrice(address);
-        if (price && price > 0) {
-          state._lastPriceUsd = price;
-          state._lastPriceTs  = now;
-        }
-      } catch (err) {
-        logger.warn('[Monitor] %s 价格拉取失败: %s', state.symbol, err.message);
-        // 如果有旧价格，宁可用旧的继续跑 RSI，不要直接 return
+      // ★ V5-13: getPrice 失败时返回 null（不再 throw），失败抑制由 birdeye.js 内部处理
+      price = await birdeye.getPrice(address);
+      if (price && price > 0) {
+        state._lastPriceUsd = price;
+        state._lastPriceTs  = now;
+      } else {
+        // 失败：如果有旧价格，宁可用旧的继续跑 RSI，不要直接 return
         if (!state._lastPriceUsd) return;
         price = state._lastPriceUsd;
       }
@@ -854,6 +852,8 @@ class TokenMonitor extends EventEmitter {
       heliusStats: heliusWs.getStats(),
       // ★ 诊断：这个 token 从 Helius 收到/解析成功的链上交易笔数
       chainStats:  heliusWs.getTokenStats(address),
+      // ★ V5-13: 这个 token 的 Birdeye 价格失败状态（None = 正常）
+      priceFail:   birdeye.getPriceFailStatus(address),
     });
 
     logger.debug('[RSI] %s price=%.6f rsi=%.2f prev=%.2f signal=%s reason=%s trades=%d inPos=%s cool=%ds',

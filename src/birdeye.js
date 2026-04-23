@@ -238,15 +238,66 @@ async function _fetchOverview(address) {
 const _priceHttpCache = new Map(); // address → { price, ts }
 const PRICE_HTTP_CACHE_MS = parseInt(process.env.PRICE_HTTP_CACHE_MS || '60000', 10); // ★ V5: 默认60秒
 
+// ★ V5-13: 失败抑制 —— Birdeye 永久/临时错误时不再每秒打 HTTP
+//   - 永久错误(400/404): Birdeye 没有此代币数据；TTL 长（默认 5 分钟）
+//   - 临时错误(429/5xx/timeout): 可能是限流或瞬时故障；TTL 短（默认 30s）
+const _priceFailCache = new Map(); // address → { status, ts, ttl, count, lastLogTs }
+const PRICE_FAIL_PERM_TTL_MS = parseInt(process.env.PRICE_FAIL_PERM_TTL_MS || '300000', 10); // 5 min
+const PRICE_FAIL_TEMP_TTL_MS = parseInt(process.env.PRICE_FAIL_TEMP_TTL_MS || '30000', 10);  // 30 s
+const PRICE_FAIL_LOG_GAP_MS  = parseInt(process.env.PRICE_FAIL_LOG_GAP_MS  || '60000', 10);  // 1 min
+
+function _recordFailure(address, status) {
+  const perm = status === 400 || status === 404;
+  const ttl = perm ? PRICE_FAIL_PERM_TTL_MS : PRICE_FAIL_TEMP_TTL_MS;
+  const prev = _priceFailCache.get(address);
+  const now = Date.now();
+  _priceFailCache.set(address, {
+    status,
+    ts: now,
+    ttl,
+    count: (prev?.count || 0) + 1,
+    lastLogTs: prev?.lastLogTs || 0,
+  });
+  // 日志去重：同一 address 同一状态码，1 分钟内只打一次
+  const entry = _priceFailCache.get(address);
+  if (now - entry.lastLogTs > PRICE_FAIL_LOG_GAP_MS) {
+    entry.lastLogTs = now;
+    if (perm) {
+      logger.warn('[Birdeye] price %s 永久错误 HTTP %d (累计 %d 次)，已静默 %ds',
+        address.slice(0, 8) + '...', status, entry.count, Math.round(ttl / 1000));
+    } else {
+      logger.warn('[Birdeye] price %s 临时错误 HTTP %d (累计 %d 次)，已静默 %ds',
+        address.slice(0, 8) + '...', status, entry.count, Math.round(ttl / 1000));
+    }
+  }
+}
+
+/** 外部查询某 address 的失败状态 */
+function getPriceFailStatus(address) {
+  const f = _priceFailCache.get(address);
+  if (!f) return null;
+  if (Date.now() - f.ts >= f.ttl) {
+    _priceFailCache.delete(address);
+    return null;
+  }
+  return { status: f.status, count: f.count, remainingMs: f.ttl - (Date.now() - f.ts) };
+}
+
 async function getPrice(address) {
   // 1. 优先用 WS 缓存（最新，10秒有效）
   const wsCached = priceStream.getCachedPrice(address);
   if (wsCached !== null) return wsCached;
 
-  // 2. HTTP 本地缓存（30秒，防止低流动性币每秒发请求）
+  // 2. HTTP 本地缓存（60秒，防止低流动性币每秒发请求）
   const httpCached = _priceHttpCache.get(address);
   if (httpCached && Date.now() - httpCached.ts < PRICE_HTTP_CACHE_MS) {
     return httpCached.price;
+  }
+
+  // ★ V5-13: 失败抑制 —— 最近失败过的直接返回 null，不发 HTTP
+  const failed = _priceFailCache.get(address);
+  if (failed && Date.now() - failed.ts < failed.ttl) {
+    return null;
   }
 
   // 3. 真实 HTTP 请求
@@ -258,12 +309,28 @@ async function getPrice(address) {
       headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`Birdeye price error: ${res.status}`);
+    if (!res.ok) {
+      _recordFailure(address, res.status);
+      return null;
+    }
     const json = await res.json();
-    if (!json.success || !json.data) throw new Error('Birdeye price 返回异常');
+    if (!json.success || !json.data) {
+      _recordFailure(address, 200); // HTTP 200 但业务失败也算一次
+      return null;
+    }
     const price = json.data.value;
+    if (!Number.isFinite(price) || price <= 0) {
+      _recordFailure(address, 200);
+      return null;
+    }
     _priceHttpCache.set(address, { price, ts: Date.now() });
+    // 成功后清除失败记录
+    if (_priceFailCache.has(address)) _priceFailCache.delete(address);
     return price;
+  } catch (err) {
+    // 超时 / 网络错误
+    _recordFailure(address, err.name === 'AbortError' ? 'TIMEOUT' : 'NET_ERR');
+    return null;
   } finally {
     clearTimeout(timeout);
   }
@@ -425,4 +492,4 @@ async function getOHLCV(address, intervalSec, bars = 150) {
   }
 }
 
-module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getV24hUSD, getOverview, clearCache, priceStream, getOHLCV };
+module.exports = { getPrice, getPriceFailStatus, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getV24hUSD, getOverview, clearCache, priceStream, getOHLCV };
