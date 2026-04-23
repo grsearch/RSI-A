@@ -6,6 +6,7 @@ const logger = winston.createLogger({
   level : process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
     winston.format.timestamp({ format: 'HH:mm:ss.SSS' }),
+    winston.format.splat(),  // ★ 支持 logger.info('%s %d', a, b) 风格的占位符替换
     winston.format.printf(({ timestamp, level, message }) =>
       `${timestamp} [${level.toUpperCase()}] ${message}`)
   ),

@@ -13,13 +13,13 @@ router.get('/dashboard', (_req, res) => res.json({
 router.get('/tokens', (_req, res) => res.json(monitor.getTokens()));
 
 // ── 手动添加代币（必须在 /tokens/:address 之前，避免 :address 匹配 "add"）──
-router.post('/tokens/add', (req, res) => {
+router.post('/tokens/add', async (req, res) => {
   const { address, symbol } = req.body || {};
   if (!address) {
     return res.status(400).json({ error: '缺少 address' });
   }
   const sym = symbol || address.slice(0, 6);
-  const added = monitor.addToken(address, sym, { network: 'solana', source: 'manual' });
+  const added = await monitor.addToken(address, sym, { network: 'solana', source: 'manual' });
   if (!added) {
     return res.status(409).json({ error: '代币已在监控中', address });
   }

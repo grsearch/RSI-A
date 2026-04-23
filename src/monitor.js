@@ -166,14 +166,14 @@ class TokenMonitor extends EventEmitter {
       FDV_EXIT, LP_EXIT, MAX_TOKENS, OVERVIEW_PATROL_SEC);
   }
 
-  _loadPersistedTokens() {
+  async _loadPersistedTokens() {
     try {
       const tokens = dataStore.loadTokens();
       if (!tokens || tokens.length === 0) return;
       logger.info('[Monitor] 从磁盘恢复 %d 个监控代币...', tokens.length);
       for (const t of tokens) {
         if (t.address && t.symbol) {
-          const added = this.addToken(t.address, t.symbol, t.meta || {});
+          const added = await this.addToken(t.address, t.symbol, t.meta || {});
           if (!added) continue;
 
           // ★ V5: 恢复保存的运行状态
@@ -268,7 +268,7 @@ class TokenMonitor extends EventEmitter {
     dataStore.stopFlush();
   }
 
-  addToken(address, symbol, meta = {}) {
+  async addToken(address, symbol, meta = {}) {
     if (this._tokens.has(address)) {
       logger.warn('[Monitor] %s 已在监控中，忽略', symbol);
       return false;
@@ -276,7 +276,7 @@ class TokenMonitor extends EventEmitter {
 
     // ★ V5: 最大监控数检查
     if (this._tokens.size >= MAX_TOKENS) {
-      const evicted = this._evictForNewToken();
+      const evicted = await this._evictForNewToken();
       if (!evicted) {
         logger.warn('[Monitor] %s 无法添加：监控已满(%d/%d)', symbol, this._tokens.size, MAX_TOKENS);
         return false;
@@ -1203,38 +1203,40 @@ class TokenMonitor extends EventEmitter {
     this._patrolTimer = setTimeout(() => this._runOverviewPatrol(), OVERVIEW_PATROL_SEC * 1000);
   }
 
-  // ── ★ V6: 监控数满时清理（按24h链上交易量(SOL)排序，清理量最小的）──────
+  // ── ★ V6: 监控数满时清理 ─────────────────────────────────
+  // V5-12: 维度从"本地 ticks 累计(SOL)"改为"Birdeye 24h volume(USD)"，数据更准确，
+  //        不受本地订阅延迟/订阅失败/新币刚加入 ticks 为空 等因素影响。
+  //        复用 token_overview 缓存，零额外 API 请求。
 
-  _evict24hVolume(state) {
-    // 统计 state.ticks 中过去24小时的链上交易量(SOL)
-    const cutoff = Date.now() - 24 * 3600 * 1000;
-    let vol = 0;
-    for (const t of state.ticks) {
-      if (t.source === 'chain' && t.ts >= cutoff && t.solAmount > 0) {
-        vol += t.solAmount;
-      }
-    }
-    return vol;
-  }
-
-  _evictForNewToken() {
+  async _evictForNewToken() {
     if (this._tokens.size < MAX_TOKENS) return true; // 有空位
 
-    // 按24h链上交易量升序排，量最小的（最不活跃）优先被清理
+    // 候选：未持仓 且 未在卖出中的币
     const candidates = Array.from(this._tokens.values())
-      .filter(s => !s.inPosition && !s._selling)  // 不清理持仓中的
-      .map(s => ({ state: s, vol24h: this._evict24hVolume(s) }))
-      .sort((a, b) => a.vol24h - b.vol24h);  // 交易量最小的排前面
+      .filter(s => !s.inPosition && !s._selling);
 
     if (candidates.length === 0) {
-      logger.warn('[Monitor] 监控已满(%d/%d)且所有代币都持仓中，无法清理', this._tokens.size, MAX_TOKENS);
+      logger.warn('[Monitor] 监控已满(%d/%d)且所有代币都持仓中，无法清理',
+        this._tokens.size, MAX_TOKENS);
       return false;
     }
 
-    const { state: victim, vol24h } = candidates[0];
-    logger.info('[Monitor] 🧹 监控已满(%d/%d)，清理24h量最低代币 %s（%.2f SOL）',
-      this._tokens.size, MAX_TOKENS, victim.symbol, vol24h);
-    this.removeToken(victim.address, `EVICTED(vol24h=${vol24h.toFixed(2)}SOL)`);
+    // 并发查 Birdeye 24h volume（命中缓存时几乎零开销）
+    const withVol = await Promise.all(candidates.map(async (s) => {
+      let vol = null;
+      try { vol = await birdeye.getV24hUSD(s.address); } catch (_) {}
+      // Birdeye 拉取失败则用 0 参与排序（最可能被淘汰，安全选择）
+      return { state: s, vol24h: vol ?? 0, volMissing: vol == null };
+    }));
+
+    // 按 24h volume 升序，最小的优先淘汰
+    withVol.sort((a, b) => a.vol24h - b.vol24h);
+
+    const { state: victim, vol24h, volMissing } = withVol[0];
+    const volStr = volMissing ? 'N/A(拉取失败)' : `$${vol24h.toFixed(0)}`;
+    logger.info('[Monitor] 🧹 监控已满(%d/%d)，清理 Birdeye 24h 量最低代币 %s (%s)',
+      this._tokens.size, MAX_TOKENS, victim.symbol, volStr);
+    this.removeToken(victim.address, `EVICTED(v24h=${volStr})`);
     return true;
   }
 }

@@ -9,7 +9,7 @@ const logger  = require('../logger');
 const MIN_FDV = parseFloat(process.env.MIN_FDV_USD || '15000');
 const MIN_LP  = parseFloat(process.env.MIN_LP_USD  || '5000');
 
-router.post('/add-token', (req, res) => {
+router.post('/add-token', async (req, res) => {
   const { address, symbol, network, fdv, lp } = req.body || {};
 
   if (!address || !symbol) {
@@ -32,7 +32,7 @@ router.post('/add-token', (req, res) => {
     }
   }
 
-  const added = monitor.addToken(address, symbol, { network: 'solana', fdv, lp });
+  const added = await monitor.addToken(address, symbol, { network: 'solana', fdv, lp });
   if (!added) {
     return res.status(409).json({ error: '代币已在监控中', address });
   }

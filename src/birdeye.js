@@ -206,11 +206,17 @@ async function _fetchOverview(address) {
     }
     const json = await res.json();
     const data = json?.data || {};
+    // Birdeye token_overview 的 24h volume 字段可能有多种命名，全都兼容
+    const v24h =
+      data.v24hUSD ?? data.v24h ?? data.volume24hUSD ?? data.volume24h ??
+      data.volume?.volume24hUSD ?? data.volume?.v24hUSD ?? null;
     const entry = {
       fdv:       data.fdv ?? data.mc ?? null,
       liquidity: data.liquidity ?? data.lp ?? null,
       // ★ V5: 代币创建时间（秒级时间戳 → 毫秒）
       createdAt: data.createdAt ? data.createdAt * 1000 : (data.createAt ? data.createAt * 1000 : null),
+      // ★ V5-12: 24h 交易量(USD)，用于淘汰判断（比本地 ticks 累计更准确）
+      v24hUSD:   typeof v24h === 'number' ? v24h : (v24h ? parseFloat(v24h) : null),
       ts:        Date.now(),
     };
     // 保留旧缓存中的 createdAt（不会变）
@@ -287,6 +293,13 @@ async function getFdvFresh(address) {
 async function getLiquidity(address) {
   const entry = await _fetchOverview(address);
   return entry?.liquidity ?? null;
+}
+
+// ★ V5-12: 获取代币 24h 交易量(USD)，用于淘汰判断
+//   复用 token_overview 缓存（默认 30 分钟），不产生额外请求
+async function getV24hUSD(address) {
+  const entry = await _fetchOverview(address);
+  return entry?.v24hUSD ?? null;
 }
 
 function clearCache(address) {
@@ -412,4 +425,4 @@ async function getOHLCV(address, intervalSec, bars = 150) {
   }
 }
 
-module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getOverview, clearCache, priceStream, getOHLCV };
+module.exports = { getPrice, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getV24hUSD, getOverview, clearCache, priceStream, getOHLCV };
