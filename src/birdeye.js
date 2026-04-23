@@ -344,20 +344,34 @@ async function getOHLCV(address, intervalSec, bars = 150) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
+  // ★ 诊断 meta：附加到返回数组上，不破坏原调用者用法
+  const meta = {
+    requestedBars: bars,
+    returnedItems: 0,
+    closedBars:    0,
+    httpStatus:    0,
+    error:         null,
+    fetchedAt:     Date.now(),
+  };
+
   try {
     const res = await fetch(url, {
       headers: { 'X-API-KEY': BIRDEYE_KEY, 'x-chain': 'solana' },
       signal: controller.signal,
     });
+    meta.httpStatus = res.status;
     if (!res.ok) {
+      meta.error = `HTTP_${res.status}`;
       logger.warn('[Birdeye] getOHLCV %s 返回 %d', address.slice(0, 8), res.status);
-      return [];
+      const empty = []; empty._meta = meta; return empty;
     }
     const json = await res.json();
     const items = json?.data?.items || [];
+    meta.returnedItems = items.length;
     if (items.length === 0) {
+      meta.error = 'NO_DATA';
       logger.warn('[Birdeye] getOHLCV %s 无数据', address.slice(0, 8));
-      return [];
+      const empty = []; empty._meta = meta; return empty;
     }
 
     // 转换为系统 candle 格式
@@ -383,13 +397,16 @@ async function getOHLCV(address, intervalSec, bars = 150) {
     // 按时间升序排列，去掉最后一根（可能未收盘）
     candles.sort((a, b) => a.openTime - b.openTime);
     const closed = candles.slice(0, -1); // 去掉最后一根未收盘K线
+    meta.closedBars = closed.length;
 
-    logger.info('[Birdeye] getOHLCV %s type=%s 拉取 %d 根历史K线 (请求%d根)',
-      address.slice(0, 8) + '...', type, closed.length, bars);
+    logger.info('[Birdeye] getOHLCV %s type=%s 拉取 %d 根历史K线 (请求%d根, Birdeye返回%d条)',
+      address.slice(0, 8) + '...', type, closed.length, bars, items.length);
+    closed._meta = meta;
     return closed;
   } catch (err) {
+    meta.error = err.name === 'AbortError' ? 'TIMEOUT' : (err.message || 'UNKNOWN');
     logger.warn('[Birdeye] getOHLCV %s 失败: %s', address.slice(0, 8), err.message);
-    return [];
+    const empty = []; empty._meta = meta; return empty;
   } finally {
     clearTimeout(timeout);
   }

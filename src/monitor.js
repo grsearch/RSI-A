@@ -154,7 +154,9 @@ class TokenMonitor extends EventEmitter {
           // ★ 重启后重新拉取历史K线（historicalCandles 不持久化，重启必须重拉）
           birdeye.getOHLCV(t.address, KLINE_SEC, HIST_BARS).then(histCandles => {
             const s = this._tokens.get(t.address);
-            if (!s || !histCandles || histCandles.length === 0) return;
+            if (!s) return;
+            s._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'EMPTY' };
+            if (!histCandles || histCandles.length === 0) return;
             s.historicalCandles = histCandles;
             logger.info('[Monitor] ♻️ %s 历史K线重载: %d 根', t.symbol, histCandles.length);
           }).catch(() => {});
@@ -287,6 +289,8 @@ class TokenMonitor extends EventEmitter {
           logger.info('[Monitor] %s 历史K线预热: %d 根 (EMA99/RSI立即可用)',
             symbol, histCandles.length);
         }
+        // ★ 诊断：记录历史K线拉取情况（不管成功失败都记）
+        s._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'UNKNOWN' };
       } catch (_) {}
     })();
 
@@ -716,6 +720,8 @@ class TokenMonitor extends EventEmitter {
     }
 
     // 9. 广播实时数据
+    const histLen = (state.historicalCandles && state.historicalCandles.length) || 0;
+    const liveLen = liveClosed.length;
     wsHub.broadcast({
       type:        'tick',
       address,
@@ -729,6 +735,13 @@ class TokenMonitor extends EventEmitter {
       signal,
       reason,
       closedCount: closedCandles.length,
+      // ★ K线诊断：分别看历史/实时/最终合并数和 Birdeye 返回情况
+      candleStats: {
+        histCount:     histLen,
+        liveCount:     liveLen,
+        mergedCount:   closedCandles.length,
+        histMeta:      state._histMeta || null,
+      },
       inPosition:  state.inPosition,
       volume,
       tradeCount:  state.tradeCount,
