@@ -805,7 +805,37 @@ class TokenMonitor extends EventEmitter {
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
-    const { rsi, prevRsi, signal, reason, volume } = evaluateSignal(closedCandles, realtimePrice, state);
+    const sigRes = evaluateSignal(closedCandles, realtimePrice, state);
+    const { rsi, prevRsi, signal, reason, volume } = sigRes;
+
+    // ★ V5-14: 决策追踪 —— 记录本次评估的完整上下文，方便排查"RSI到80为什么没卖"
+    //   只存最近一次到 state，广播时附带
+    {
+      const lastCloses = closedCandles.slice(-5).map(c => c.close).filter(Number.isFinite);
+      const ema99 = lastCloses.length >= 2 ? null : null; // 实际 EMA99 在 rsi.js 内部算，这里存数据特征
+      const lastClose = closedCandles.length > 0 ? closedCandles[closedCandles.length-1].close : null;
+      const lastCandleTs = closedCandles.length > 0 ? closedCandles[closedCandles.length-1].openTime : null;
+      state._signalTrace = {
+        ts: now,
+        closedCount:    closedCandles.length,
+        realtimePrice,
+        lastClose,
+        lastCandleTs,
+        rsi:            Number.isFinite(rsi) ? parseFloat(rsi.toFixed(2)) : null,
+        prevRsi:        Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null,
+        signal:         signal || null,
+        reason:         reason || '',
+        // 关键去重字段：用于诊断"本应触发的信号被同一K线去重挡住"
+        lastBuyCandle:  state._lastBuyCandle  ?? null,
+        lastSellCandle: state._lastSellCandle ?? null,
+        // 冷却/持仓状态
+        inPosition:     !!state.inPosition,
+        selling:        !!state._selling,
+        cooldownSec:    state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
+        // 最近 5 根 close，方便对比 GMGN 图表
+        recentCloses:   lastCloses.map(v => Number(v.toPrecision(6))),
+      };
+    }
 
     // 8. 记录信号
     if (reason && reason !== '' && reason !== 'rsi_rebase') {
@@ -854,6 +884,8 @@ class TokenMonitor extends EventEmitter {
       chainStats:  heliusWs.getTokenStats(address),
       // ★ V5-13: 这个 token 的 Birdeye 价格失败状态（None = 正常）
       priceFail:   birdeye.getPriceFailStatus(address),
+      // ★ V5-14: 决策追踪（最近一次 evaluateSignal 的完整上下文）
+      signalTrace: state._signalTrace || null,
     });
 
     logger.debug('[RSI] %s price=%.6f rsi=%.2f prev=%.2f signal=%s reason=%s trades=%d inPos=%s cool=%ds',

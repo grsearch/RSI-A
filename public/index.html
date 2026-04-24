@@ -406,6 +406,32 @@ function _updateTickCells(tr, d) {
   cells[6].className = rsiClass(rsi);
   cells[7].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);
   cells[7].className = rsiClass(d.prevRsi);
+  // ★ V5-14: RSI 列 tooltip —— 决策追踪，看这次评估的完整上下文
+  const st = d.signalTrace;
+  if (st) {
+    const ago = Math.max(0, Math.floor((Date.now() - st.ts) / 1000));
+    const tip =
+      `决策追踪 (${ago}s前):\n` +
+      `  K线数: ${st.closedCount}\n` +
+      `  实时RSI: ${st.rsi ?? 'NaN'}   prevRSI: ${st.prevRsi ?? 'NaN'}\n` +
+      `  最新K线收盘价: ${st.lastClose}\n` +
+      `  实时价格: ${st.realtimePrice}\n` +
+      `  信号: ${st.signal || '(无)'}\n` +
+      `  原因: ${st.reason || '(静默,落到默认 HOLD)'}\n` +
+      `\n去重/持仓状态:\n` +
+      `  当前K线ts: ${st.lastCandleTs}\n` +
+      `  _lastBuyCandle:  ${st.lastBuyCandle}\n` +
+      `  _lastSellCandle: ${st.lastSellCandle}\n` +
+      `  inPosition: ${st.inPosition}   selling: ${st.selling}   cooldown: ${st.cooldownSec}s\n` +
+      `\n最近5根K线收盘价(对比 GMGN 判断数据源是否一致):\n  ${(st.recentCloses||[]).join(' → ')}`;
+    cells[6].title = tip;
+    cells[7].title = tip;
+    cells[6].style.cursor = 'help';
+    cells[7].style.cursor = 'help';
+  } else {
+    cells[6].title = '';
+    cells[7].title = '';
+  }
   cells[8].textContent = bsStr;
   cells[8].className = volClass(bv, sv);
   // ★ 诊断 tooltip：看这个币到底从 Helius 收到多少笔链上交易
